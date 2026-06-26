@@ -10,6 +10,7 @@ from urllib3 import HTTPHeaderDict
 
 import voip
 from voip.sdp.messages import SessionDescription
+from voip.siprec import SIPRECBody
 
 from ..types import ByteSerializableObject
 from .types import CallerID, SIPMethod, SIPStatus, SipURI
@@ -41,6 +42,8 @@ class SIPHeaderDict(ByteSerializableObject, HTTPHeaderDict):
         self = SIPHeaderDict()
         for line in data.decode().split("\r\n"):
             name, sep, value = line.partition(":")
+            if line == "\r\n":
+                continue
             if not sep:
                 raise ValueError(f"Invalid header: {line!r}")
             name = name.strip()
@@ -60,7 +63,9 @@ class Message(ByteSerializableObject, abc.ABC):
     headers: SIPHeaderDict | dict[str, str | CallerID] = dataclasses.field(
         default_factory=SIPHeaderDict, repr=False
     )
-    body: SessionDescription | None = dataclasses.field(default=None, repr=False)
+    body: SessionDescription | SIPRECBody | None = dataclasses.field(
+        default=None, repr=False
+    )
     version: str = "SIP/2.0"
 
     def __post_init__(self):
@@ -95,10 +100,16 @@ class Message(ByteSerializableObject, abc.ABC):
         )
 
     @staticmethod
-    def parse_body(headers: dict[str, str], body: bytes) -> SessionDescription | None:
+    def parse_body(
+        headers: dict[str, str], body: bytes
+    ) -> SessionDescription | SIPRECBody | None:
         """Parse the body according to the Content-Type header."""
-        if headers.get("Content-Type") == "application/sdp" and body:
+        content_type = headers.get("Content-Type", "")
+        media_type = content_type.partition(";")[0].strip().lower()
+        if media_type == "application/sdp" and body:
             return SessionDescription.parse(body)
+        if media_type.startswith("multipart/") and body:
+            return SIPRECBody.parse(content_type, body)
         return None
 
     def __bytes__(self) -> bytes:

@@ -146,3 +146,15 @@ For raw audio access without transcription, subclass `AudioCall` and override
 `audio_received(self, audio: np.ndarray)` instead.
 
 [ollama]: https://ollama.com/
+
+
+# Hermes agent SIP Gateway
+
+Exploration and work in progress per RFCs: 7865, 7866, 9806
+
+The agent can connect on a kamailio proxy directly, no livekit. and all that is needed is a "siprec-auto" flag
+in rtpengine_manage function.
+
+The agent will receives 2 RTP streams per calls. No need for flaky voice identification.
+Using local STT, the agent can assits you, create memories, tasks from the calls you have with others.
+

@@ -1,0 +1,23 @@
+name: sip-voip-gateway
+label: SIP VoIP Gateway Listener
+kind: platform
+version: 0.1.0
+description: Passive SIPREC transcription ingestion adapter for Hermes using VoIP.
+author: internal
+
+requires_env:
+  - name: SIPREC_AOR
+    description: "SIPREC registration AOR, e.g. sip:user:password@sip.example.com;+sip.srs"
+    prompt: "SIPREC AOR"
+    password: true
+
+optional_env:
+  - name: SIPREC_HOST
+    description: "SIP proxy host, if not derived from SIPREC_AOR"
+    prompt: "SIPREC host"
+    password: false
+
+  - name: SIPREC_PORT
+    description: "SIP proxy port"
+    prompt: "SIPREC port"
+    password: false

@@ -247,7 +247,7 @@ class STUNProtocol(asyncio.DatagramProtocol):
         try:
             host, port = xor_mapped or mapped
             host = ipaddress.ip_address(host)
-        except ValueError, TypeError:
+        except (ValueError, TypeError):
             logger.exception("No address attribute in STUN response")
         else:
             self.stun_connection_made(self.transport, NetworkAddress(host, port))

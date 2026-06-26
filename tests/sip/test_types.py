@@ -262,6 +262,17 @@ class TestSipURI:
                     headers={"Subject": ""},
                 ),
             ),
+            # RFC 3840/RFC 7866 feature tag parameter.
+            (
+                "sip:alice@example.com;+sip.srs",
+                SipURI(
+                    scheme="sip",
+                    user="alice",
+                    host="example.com",
+                    port=5060,
+                    parameters={"+sip.srs": None},
+                ),
+            ),
         ],
     )
     def test_parse__flag_parameter_and_valueless_header(

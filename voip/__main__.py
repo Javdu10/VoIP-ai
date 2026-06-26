@@ -125,6 +125,12 @@ def voip(ctx, verbose: int = 0):
     help="STUN server for RTP NAT traversal.",
 )
 @click.option(
+    "--no-stun",
+    is_flag=True,
+    default=False,
+    help="Disable STUN and advertise the local RTP socket address.",
+)
+@click.option(
     "--no-verify-tls",
     is_flag=True,
     default=False,
@@ -136,13 +142,19 @@ def voip(ctx, verbose: int = 0):
     default="stdio",
     show_default=True,
 )
-def mcp(aor: SipURI, stun_server: NetworkAddress, no_verify_tls: bool, transport: str):
+def mcp(
+    aor: SipURI,
+    stun_server: NetworkAddress,
+    no_stun: bool,
+    no_verify_tls: bool,
+    transport: str,
+):
     from .mcp import run
 
     asyncio.run(
         run(
             aor,
-            stun_server=stun_server,
+            stun_server=None if no_stun else stun_server,
             no_verify_tls=no_verify_tls,
             transport=transport,
         )
@@ -167,20 +179,35 @@ def mcp(aor: SipURI, stun_server: NetworkAddress, no_verify_tls: bool, transport
     help="STUN server for RTP NAT traversal.",
 )
 @click.option(
+    "--no-stun",
+    is_flag=True,
+    default=False,
+    help="Disable STUN and advertise the local RTP socket address.",
+)
+@click.option(
     "--no-verify-tls",
     is_flag=True,
     default=False,
     help="Disable TLS certificate verification (insecure; for testing only).",
 )
+@click.option(
+    "--bind",
+    "rtp_bind_address",
+    envvar="RTP_BIND_ADDRESS",
+    metavar="HOST",
+    default=None,
+    help="Bind RTP to HOST and advertise that address in SDP.",
+)
 @click.pass_context
-def sip(ctx, aor, stun_server, no_verify_tls):
+def sip(ctx, aor, stun_server, no_stun, no_verify_tls, rtp_bind_address):
     """Session Initiation Protocol (SIP)."""
     ctx.ensure_object(dict)
     ctx.obj.update(
         aor=aor,
         proxy_addr=aor.maddr,
-        stun_server=stun_server,
+        stun_server=None if no_stun or rtp_bind_address else stun_server,
         no_verify_tls=no_verify_tls,
+        rtp_bind_address=rtp_bind_address,
     )
 
 
@@ -212,6 +239,7 @@ def echo(ctx, dial: str | None):
                 verbose=obj.get("verbose", 0),
                 no_verify_tls=obj["no_verify_tls"],
                 stun_server=obj["stun_server"],
+                rtp_bind_address=obj["rtp_bind_address"],
             )
         else:
             protocol = await ConsoleMessageProtocol.run(
@@ -220,6 +248,7 @@ def echo(ctx, dial: str | None):
                 verbose=obj.get("verbose", 0),
                 no_verify_tls=obj["no_verify_tls"],
                 stun_server=obj["stun_server"],
+                rtp_bind_address=obj["rtp_bind_address"],
             )
             await OutboundDialog(sip=protocol).dial(
                 parse_uri(dial, aor),
@@ -280,6 +309,7 @@ def transcribe(ctx, stt_model, dial: str | None):
                 verbose=obj.get("verbose", 0),
                 no_verify_tls=obj["no_verify_tls"],
                 stun_server=obj["stun_server"],
+                rtp_bind_address=obj["rtp_bind_address"],
             )
         else:
             protocol = await ConsoleMessageProtocol.run(
@@ -288,6 +318,7 @@ def transcribe(ctx, stt_model, dial: str | None):
                 verbose=obj.get("verbose", 0),
                 no_verify_tls=obj["no_verify_tls"],
                 stun_server=obj["stun_server"],
+                rtp_bind_address=obj["rtp_bind_address"],
             )
             await OutboundDialog(sip=protocol).dial(
                 parse_uri(dial, aor),
@@ -406,6 +437,7 @@ def agent(
                 verbose=obj.get("verbose", 0),
                 no_verify_tls=obj["no_verify_tls"],
                 stun_server=obj["stun_server"],
+                rtp_bind_address=obj["rtp_bind_address"],
             )
         else:
             protocol = await ConsoleMessageProtocol.run(
@@ -414,6 +446,7 @@ def agent(
                 verbose=obj.get("verbose", 0),
                 no_verify_tls=obj["no_verify_tls"],
                 stun_server=obj["stun_server"],
+                rtp_bind_address=obj["rtp_bind_address"],
             )
             await OutboundDialog(sip=protocol).dial(
                 parse_uri(dial, aor),
@@ -455,6 +488,7 @@ def say(ctx, target: str, prompt: str, voice: str):
             verbose=obj.get("verbose", 0),
             no_verify_tls=obj["no_verify_tls"],
             stun_server=obj["stun_server"],
+            rtp_bind_address=obj["rtp_bind_address"],
         )
         await OutboundDialog(sip=protocol).dial(
             parse_uri(target, aor),

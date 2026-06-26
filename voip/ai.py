@@ -80,6 +80,10 @@ class TranscribeCall(VoiceActivityCall):
         loop = asyncio.get_running_loop()
         raw = await loop.run_in_executor(None, self.run_transcription, audio)
         if text := raw.strip():
+            if self.recording_metadata is not None and self.media_label is not None:
+                text = self.recording_metadata.prefix_transcription(
+                    self.media_label, text
+                )
             self.transcription_received(text)
 
     def run_transcription(self, audio: np.ndarray) -> str:

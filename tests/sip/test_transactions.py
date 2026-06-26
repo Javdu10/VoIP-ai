@@ -5,7 +5,7 @@ import asyncio
 from voip.sip import messages
 from voip.sip.dialog import Dialog
 from voip.sip.protocol import SessionInitiationProtocol
-from voip.sip.transactions import DigestAuthMixin, InviteTransaction
+from voip.sip.transactions import DigestAuthMixin, InviteTransaction, RegisterTransaction
 from voip.sip.types import SIPMethod, SIPStatus, SipURI
 from voip.srtp import SRTPSession
 
@@ -130,6 +130,48 @@ def _last_ack(sip: SessionInitiationProtocol) -> messages.Request:
         if isinstance(request, messages.Request) and request.method == SIPMethod.ACK:
             return request
     raise AssertionError("no ACK was sent")
+
+
+async def test_ringing_response_has_single_transaction_headers(sip):
+    """180 Ringing must not duplicate Via or CSeq headers."""
+    request = messages.Message.parse(
+        b"INVITE sip:alice@example.com SIP/2.0\r\n"
+        b"Via: SIP/2.0/UDP 127.0.0.1;branch=z9hG4bKproxy\r\n"
+        b"Via: SIP/2.0/UDP 127.0.0.1:5080;branch=z9hG4bKuac\r\n"
+        b"From: sip:bob@example.com;tag=from-tag\r\n"
+        b"To: sip:alice@example.com\r\n"
+        b"Call-ID: ringing@example.com\r\n"
+        b"CSeq: 1 INVITE\r\n"
+        b"\r\n"
+    )
+    tx = InviteTransaction.from_request(request=request, sip=sip)
+
+    tx.ringing()
+
+    response = messages.Message.parse(sip.transport.sent[-1])
+    assert response.status_code == SIPStatus.RINGING
+    assert response.headers.getlist("CSeq") == ["1 INVITE"]
+    assert response.headers.getlist("Via") == [
+        "SIP/2.0/UDP 127.0.0.1;branch=z9hG4bKproxy",
+        "SIP/2.0/UDP 127.0.0.1:5080;branch=z9hG4bKuac",
+    ]
+
+
+async def test_register_contact_includes_aor_feature_tags(fake_transport, rtp):
+    """AoR feature tags are Contact header params, not URI params."""
+    sip = SessionInitiationProtocol(
+        aor=SipURI.parse("sip:alice:secret@example.com;+sip.srs"),
+        rtp=rtp,
+        dialog_class=Dialog,
+    )
+    sip.connection_made(fake_transport)
+
+    RegisterTransaction(sip=sip, method=SIPMethod.REGISTER)
+
+    request = _last_request(sip)
+    assert request.headers["Contact"] == (
+        "<sip:alice@192.0.2.1:5004;transport=tls;ob>;+sip.srs"
+    )
 
 
 class TestInviteAck:
@@ -549,5 +591,95 @@ class TestInviteSrtp:
         assert session.srtp.master_key == send_session.master_key
         assert session.srtp_recv is not None
         assert session.srtp_recv.master_key == remote_session.master_key
+
+        recv_task.cancel()
+
+
+class TestInviteTransactionSiprec:
+    async def test_answer__creates_session_per_labeled_audio_stream(self, sip):
+        """Create one RTP session per labeled SIPREC audio stream."""
+        body = (
+            b"--boundary\r\n"
+            b"Content-Type: application/sdp\r\n\r\n"
+            b"v=0\r\n"
+            b"o=- 1 1 IN IP4 192.0.2.10\r\n"
+            b"s=-\r\n"
+            b"t=0 0\r\n"
+            b"m=audio 4000 RTP/AVP 0\r\n"
+            b"c=IN IP4 192.0.2.10\r\n"
+            b"a=label:0\r\n"
+            b"a=rtpmap:0 PCMU/8000\r\n"
+            b"a=sendonly\r\n"
+            b"m=audio 4002 RTP/AVP 0\r\n"
+            b"c=IN IP4 192.0.2.11\r\n"
+            b"a=label:1\r\n"
+            b"a=rtpmap:0 PCMU/8000\r\n"
+            b"a=sendonly\r\n"
+            b"--boundary\r\n"
+            b"Content-Type: application/rs-metadata+xml\r\n\r\n"
+            b"<recording xmlns=\"urn:ietf:params:xml:ns:recording:1\">"
+            b"<participant participant_id=\"p-caller\">"
+            b"<nameID aor=\"sip:caller@example.com\">"
+            b"<name>caller</name></nameID></participant>"
+            b"<participant participant_id=\"p-callee\">"
+            b"<nameID aor=\"sip:callee@example.com\">"
+            b"<name>callee</name></nameID></participant>"
+            b"<stream stream_id=\"m-0\"><label>0</label></stream>"
+            b"<participantstreamassoc participant_id=\"p-caller\" "
+            b"stream_id=\"m-0\"><send/></participantstreamassoc>"
+            b"<stream stream_id=\"m-1\"><label>1</label></stream>"
+            b"<participantstreamassoc participant_id=\"p-callee\" "
+            b"stream_id=\"m-1\"><recv/></participantstreamassoc>"
+            b"</recording>\r\n"
+            b"--boundary--\r\n"
+        )
+        request = messages.Message.parse(
+            b"INVITE sip:alice@example.com SIP/2.0\r\n"
+            b"Via: SIP/2.0/TLS 192.0.2.1:5061;branch=z9hG4bKsiprec\r\n"
+            b"From: sip:bob@biloxi.com;tag=from-tag-siprec\r\n"
+            b"To: sip:alice@example.com\r\n"
+            b"Call-ID: siprec@biloxi.com\r\n"
+            b"CSeq: 1 INVITE\r\n"
+            b"Content-Type: multipart/mixed; boundary=boundary\r\n"
+            b"\r\n"
+            + body
+        )
+
+        captured: dict = {}
+
+        class AnsweringDialog(Dialog):
+            """Answer inbound calls with the test CallFixture session."""
+
+            def call_received(self) -> None:
+                captured["dialog"] = self
+                self.answer(session_class=CallFixture)
+
+        sip.dialog_class = AnsweringDialog
+        recv_task = asyncio.create_task(
+            InviteTransaction.receive(request=request, sip=sip)
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        dialog = captured["dialog"]
+        assert [session.media_label for session in dialog.sessions] == ["0", "1"]
+        assert dialog.session is dialog.sessions[0]
+        assert set(dialog.sessions[0].rtp.calls) == {("192.0.2.10", 4000)}
+        assert set(dialog.sessions[1].rtp.calls) == {("192.0.2.11", 4002)}
+        assert all(
+            session.recording_metadata is request.body.metadata
+            for session in dialog.sessions
+        )
+
+        ok = messages.Message.parse(sip.transport.sent[-1])
+        assert [media.port for media in ok.body.media] == [5004, 5006]
+        assert [
+            next(attr.value for attr in media.attributes if attr.name == "label")
+            for media in ok.body.media
+        ] == ["0", "1"]
+        assert all(
+            any(attr.name == "recvonly" for attr in media.attributes)
+            for media in ok.body.media
+        )
 
         recv_task.cancel()

@@ -11,7 +11,7 @@ import secrets
 import typing
 import uuid
 
-from voip.rtp import Session
+from voip.rtp import RealtimeTransportProtocol, Session
 from voip.sdp.messages import SessionDescription
 from voip.sdp.types import (
     Attribute,
@@ -501,7 +501,6 @@ class InviteTransaction(DigestAuthMixin, Transaction):
                 dialog=self.dialog,
                 status_code=SIPStatus.RINGING,
                 phrase=SIPStatus.RINGING.phrase,
-                headers=self.headers,
             )
         )
 
@@ -517,7 +516,6 @@ class InviteTransaction(DigestAuthMixin, Transaction):
                 dialog=self.dialog,
                 status_code=status_code,
                 phrase=status_code.phrase,
-                headers=self.headers,
             )
         )
 
@@ -545,53 +543,64 @@ class InviteTransaction(DigestAuthMixin, Transaction):
             NotImplementedError: When `negotiate_codec` raises (no supported
                 codec in the remote SDP offer).
         """
+        body = self.request.body
+        remote_audio_list = [
+            media for media in (body.media if body else []) if media.media == "audio"
+        ]
+        if not remote_audio_list:
+            remote_audio_list = [None]
+
+        if len(remote_audio_list) > 1:
+            asyncio.create_task(
+                self.answer_multi_stream(
+                    remote_audio_list=remote_audio_list,
+                    session_class=session_class,
+                    session_kwargs=session_kwargs,
+                )
+            )
+            return
+
+        self.answer_with_rtp_endpoints(
+            remote_audio_list=remote_audio_list,
+            rtp_endpoints=[self.sip.rtp],
+            session_class=session_class,
+            session_kwargs=session_kwargs,
+        )
+
+    async def answer_multi_stream(
+        self,
+        *,
+        remote_audio_list: list[MediaDescription | None],
+        session_class: type[Session],
+        session_kwargs: dict[str, typing.Any],
+    ) -> None:
+        """Answer a multipart offer with one local RTP endpoint per stream."""
+        rtp_endpoints = [self.sip.rtp]
+        for index in range(1, len(remote_audio_list)):
+            rtp_endpoints.append(await self.sip.rtp.create_sibling(index))
+        self.answer_with_rtp_endpoints(
+            remote_audio_list=remote_audio_list,
+            rtp_endpoints=rtp_endpoints,
+            session_class=session_class,
+            session_kwargs=session_kwargs,
+        )
+
+    def answer_with_rtp_endpoints(
+        self,
+        *,
+        remote_audio_list: list[MediaDescription | None],
+        rtp_endpoints: list[RealtimeTransportProtocol],
+        session_class: type[Session],
+        session_kwargs: dict[str, typing.Any],
+    ) -> None:
+        """Build sessions and send the 200 OK SDP answer."""
         peer = (
             self.sip.transport.get_extra_info("peername")
             if self.sip.transport
             else None
         )
         caller = CallerID(self.request.headers.get("From", ""))
-        remote_audio = next(
-            (
-                m
-                for m in (self.request.body.media if self.request.body else [])
-                if m.media == "audio"
-            ),
-            None,
-        )
-        if remote_audio is not None:
-            negotiated_media = session_class.negotiate_codec(remote_audio)
-        else:
-            negotiated_media = MediaDescription(
-                media="audio",
-                port=0,
-                proto="RTP/SAVP",
-                fmt=[RTPPayloadFormat.from_pt(0)],
-            )
-
-        # SRTP when the offer is `RTP/SAVP` (or `SAVPF`) and carries an SDES
-        # `a=crypto:` key.  We generate a fresh send session (its key goes into
-        # our 200-OK `a=crypto:`) and parse the offer's crypto to decrypt the
-        # caller's media — SDES keys each direction independently (RFC 4568).
-        is_srtp = negotiated_media.proto.startswith("RTP/SAVP")
-        srtp_send = SRTPSession.generate() if is_srtp else None
-        offer_crypto = (
-            next(
-                (
-                    attr
-                    for attr in remote_audio.attributes
-                    if attr.name == "crypto" and attr.value
-                ),
-                None,
-            )
-            if remote_audio is not None
-            else None
-        )
-        srtp_recv = (
-            SRTPSession.from_sdes(offer_crypto.value)
-            if is_srtp and offer_crypto is not None
-            else None
-        )
+        body = self.request.body
 
         self.dialog.local_party = (
             f"{self.request.headers['To']};tag={self.dialog.local_tag}"
@@ -600,43 +609,80 @@ class InviteTransaction(DigestAuthMixin, Transaction):
         self.dialog.route_set = list(self.request.headers.getlist("Record-Route"))
         self.sip.register_dialog(self.dialog)
 
-        session = session_class(
-            rtp=self.sip.rtp,
-            caller=caller,
-            media=negotiated_media,
-            srtp=srtp_send,
-            srtp_recv=srtp_recv,
-            dialog=self.dialog,
-            **session_kwargs,
-        )
-        self.dialog.session = session
-        if remote_audio is not None and remote_audio.port != 0:
-            media_connection = remote_audio.connection
-            session_connection = (
-                self.request.body.connection if self.request.body else None
-            )
-            connection = media_connection or session_connection
-            if connection is not None:
-                remote_ip = connection.connection_address
+        sessions = []
+        response_media = []
+        first_rtp_public = rtp_endpoints[0].public_address.result()
+        for remote_audio, rtp_endpoint in zip(remote_audio_list, rtp_endpoints):
+            rtp_public = rtp_endpoint.public_address.result()
+            if remote_audio is not None:
+                negotiated_media = session_class.negotiate_codec(remote_audio)
             else:
-                remote_ip = peer[0] if peer else "0.0.0.0"  # noqa: S104
-            remote_rtp_address: NetworkAddress | None = NetworkAddress(
-                remote_ip, remote_audio.port
-            )
-        else:
-            remote_rtp_address = None
-        self.sip.rtp.register_call(remote_rtp_address, session)
+                negotiated_media = MediaDescription(
+                    media="audio",
+                    port=0,
+                    proto="RTP/SAVP",
+                    fmt=[RTPPayloadFormat.from_pt(0)],
+                )
 
-        if remote_rtp_address is not None:
-            self.sip.rtp.send(b"\x00", remote_rtp_address)
+            # SRTP when the offer is `RTP/SAVP` (or `SAVPF`) and carries an SDES
+            # `a=crypto:` key.  We generate a fresh send session (its key goes into
+            # our 200-OK `a=crypto:`) and parse the offer's crypto to decrypt the
+            # caller's media — SDES keys each direction independently (RFC 4568).
+            is_srtp = negotiated_media.proto.startswith("RTP/SAVP")
+            srtp_send = SRTPSession.generate() if is_srtp else None
+            offer_crypto = (
+                next(
+                    (
+                        attr
+                        for attr in remote_audio.attributes
+                        if attr.name == "crypto" and attr.value
+                    ),
+                    None,
+                )
+                if remote_audio is not None
+                else None
+            )
+            srtp_recv = (
+                SRTPSession.from_sdes(offer_crypto.value)
+                if is_srtp and offer_crypto is not None
+                else None
+            )
+            media_label = self.media_label(remote_audio)
+            session = session_class(
+                rtp=rtp_endpoint,
+                caller=caller,
+                media=negotiated_media,
+                srtp=srtp_send,
+                srtp_recv=srtp_recv,
+                dialog=self.dialog,
+                media_label=media_label,
+                recording_metadata=getattr(body, "metadata", None),
+                **session_kwargs,
+            )
+            sessions.append(session)
+
+            remote_rtp_address = self.remote_rtp_address(remote_audio, peer)
+            rtp_endpoint.register_call(remote_rtp_address, session)
+            if remote_rtp_address is not None:
+                rtp_endpoint.send(b"\x00", remote_rtp_address)
+
+            response_media.append(
+                MediaDescription(
+                    media="audio",
+                    port=rtp_public[1],
+                    proto=negotiated_media.proto,
+                    fmt=negotiated_media.fmt,
+                    attributes=self.answer_attributes(remote_audio, media_label, srtp_send),
+                )
+            )
+
+        self.dialog.sessions = sessions
+        self.dialog.session = sessions[0]
 
         session_id = str(secrets.randbelow(2**32) + 1)
-        rtp_public = self.sip.rtp.public_address.result()
-        sdp_media_attributes = [Attribute(name="sendrecv")]
-        if srtp_send is not None:
-            sdp_media_attributes.append(
-                Attribute(name="crypto", value=srtp_send.sdes_attribute)
-            )
+        addrtype = (
+            "IP6" if isinstance(first_rtp_public[0], ipaddress.IPv6Address) else "IP4"
+        )
         self.send_response(
             Response.from_request(
                 request=self.request,
@@ -655,31 +701,75 @@ class InviteTransaction(DigestAuthMixin, Transaction):
                         sess_id=session_id,
                         sess_version=session_id,
                         nettype="IN",
-                        addrtype="IP6"
-                        if isinstance(rtp_public[0], ipaddress.IPv6Address)
-                        else "IP4",
-                        unicast_address=str(rtp_public[0]),
+                        addrtype=addrtype,
+                        unicast_address=str(first_rtp_public[0]),
                     ),
                     timings=[Timing(start_time=0, stop_time=0)],
                     connection=ConnectionData(
                         nettype="IN",
-                        addrtype="IP6"
-                        if isinstance(rtp_public[0], ipaddress.IPv6Address)
-                        else "IP4",
-                        connection_address=str(rtp_public[0]),
+                        addrtype=addrtype,
+                        connection_address=str(first_rtp_public[0]),
                     ),
-                    media=[
-                        MediaDescription(
-                            media="audio",
-                            port=rtp_public[1],
-                            proto=negotiated_media.proto,
-                            fmt=negotiated_media.fmt,
-                            attributes=sdp_media_attributes,
-                        )
-                    ],
+                    media=response_media,
                 ),
             )
         )
+
+    @staticmethod
+    def media_label(media: MediaDescription | None) -> str | None:
+        """Return the SDP label for a media description."""
+        if media is None:
+            return None
+        return next(
+            (attr.value for attr in media.attributes if attr.name == "label"),
+            None,
+        )
+
+    @staticmethod
+    def answer_direction(media: MediaDescription | None) -> str:
+        """Return the answer direction for an offered media stream."""
+        if media is None:
+            return "sendrecv"
+        names = {attr.name for attr in media.attributes}
+        if "sendonly" in names:
+            return "recvonly"
+        if "recvonly" in names:
+            return "sendonly"
+        if "inactive" in names:
+            return "inactive"
+        return "sendrecv"
+
+    @classmethod
+    def answer_attributes(
+        cls,
+        remote_audio: MediaDescription | None,
+        media_label: str | None,
+        srtp_send: SRTPSession | None,
+    ) -> list[Attribute]:
+        """Return SDP attributes for an answered media stream."""
+        attributes = [Attribute(name=cls.answer_direction(remote_audio))]
+        if media_label is not None:
+            attributes.append(Attribute(name="label", value=media_label))
+        if srtp_send is not None:
+            attributes.append(Attribute(name="crypto", value=srtp_send.sdes_attribute))
+        return attributes
+
+    def remote_rtp_address(
+        self, remote_audio: MediaDescription | None, peer: tuple | None
+    ) -> NetworkAddress | None:
+        """Return the remote RTP address for an offered media stream."""
+        if remote_audio is None or remote_audio.port == 0:
+            return None
+        media_connection = remote_audio.connection
+        session_connection = (
+            self.request.body.connection if self.request.body else None
+        )
+        connection = media_connection or session_connection
+        if connection is not None:
+            remote_ip = connection.connection_address
+        else:
+            remote_ip = peer[0] if peer else "0.0.0.0"  # noqa: S104
+        return NetworkAddress(remote_ip, remote_audio.port)
 
     @classmethod
     async def send(

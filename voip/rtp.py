@@ -119,6 +119,8 @@ class Session:
     caller: CallerID
     srtp: SRTPSession | None = None
     srtp_recv: SRTPSession | None = None
+    media_label: str | None = None
+    recording_metadata: typing.Any = None
 
     def packet_received(self, packet: RTPPacket, addr: NetworkAddress) -> None:
         """Handle a parsed RTP packet. Override in subclasses to process media.
@@ -264,6 +266,17 @@ class RealtimeTransportProtocol(STUNProtocol):
         )
         await rtp.public_address
         return rtp
+
+    async def create_sibling(self, offset: int = 1) -> RealtimeTransportProtocol:
+        """Create another RTP endpoint with the same STUN behavior."""
+        if self.transport is None:
+            host, port = self.public_address.result()
+            rtp = type(self)(stun_server_address=self.stun_server_address)
+            rtp.public_address = asyncio.get_running_loop().create_future()
+            rtp.public_address.set_result(NetworkAddress(host, port + (offset * 2)))
+            return rtp
+        host = self.transport.get_extra_info("sockname")[0]
+        return await type(self).serve(host, self.stun_server_address)
 
     def register_call(
         self,

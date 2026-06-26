@@ -132,6 +132,7 @@ class SessionInitiationProtocol(asyncio.Protocol, asyncio.DatagramProtocol):
         rtp: RealtimeTransportProtocol | None = None,
         no_verify_tls: bool = False,
         stun_server: NetworkAddress | None = None,
+        rtp_bind_address: str | None = None,
         **kwargs: typing.Any,
     ) -> SessionInitiationProtocol:
         """Connect to the SIP proxy and return once registered.
@@ -158,6 +159,8 @@ class SessionInitiationProtocol(asyncio.Protocol, asyncio.DatagramProtocol):
                 testing only. Defaults to `False`.
             stun_server: STUN server for RTP NAT traversal. Ignored when *rtp*
                 is provided.
+            rtp_bind_address: Local RTP bind address. When unset, the address
+                family is inferred from the SIP proxy and a wildcard address is used.
             **kwargs: Extra keyword arguments forwarded to the protocol constructor.
 
         Returns:
@@ -169,9 +172,10 @@ class SessionInitiationProtocol(asyncio.Protocol, asyncio.DatagramProtocol):
             addr_info = socket.getaddrinfo(
                 str(aor.maddr[0]), aor.maddr[1], type=socket.SOCK_DGRAM
             )
-            rtp_bind_address = (
-                "::" if addr_info[0][0] == socket.AF_INET6 else "0.0.0.0"  # noqa: S104
-            )
+            if rtp_bind_address is None:
+                rtp_bind_address = (
+                    "::" if addr_info[0][0] == socket.AF_INET6 else "0.0.0.0"  # noqa: S104
+                )
             rtp = await RealtimeTransportProtocol.serve(rtp_bind_address, stun_server)
         if aor.transport == "UDP":
             _, protocol = await loop.create_datagram_endpoint(
@@ -203,6 +207,7 @@ class SessionInitiationProtocol(asyncio.Protocol, asyncio.DatagramProtocol):
         rtp: RealtimeTransportProtocol | None = None,
         no_verify_tls: bool = False,
         stun_server: NetworkAddress | None = None,
+        rtp_bind_address: str | None = None,
         **kwargs: typing.Any,
     ) -> None:
         """Register with a carrier and handle inbound calls, reconnecting on disconnect.
@@ -225,15 +230,18 @@ class SessionInitiationProtocol(asyncio.Protocol, asyncio.DatagramProtocol):
             no_verify_tls: Disable TLS certificate verification. Insecure; for
                 testing only. Defaults to `False`.
             stun_server: STUN server for RTP NAT traversal.
+            rtp_bind_address: Local RTP bind address. When unset, the address
+                family is inferred from the SIP proxy and a wildcard address is used.
             **kwargs: Extra keyword arguments forwarded to the protocol constructor.
         """
         addr_info = socket.getaddrinfo(
             str(aor.maddr[0]), aor.maddr[1], type=socket.SOCK_DGRAM
         )
         if rtp is None:
-            rtp_bind_address = (
-                "::" if addr_info[0][0] == socket.AF_INET6 else "0.0.0.0"  # noqa: S104
-            )
+            if rtp_bind_address is None:
+                rtp_bind_address = (
+                    "::" if addr_info[0][0] == socket.AF_INET6 else "0.0.0.0"  # noqa: S104
+                )
             rtp = await RealtimeTransportProtocol.serve(rtp_bind_address, stun_server)
         backoff_secs = 1
         while True:
@@ -274,10 +282,7 @@ class SessionInitiationProtocol(asyncio.Protocol, asyncio.DatagramProtocol):
 
     def drop_transaction(self, tx: Transaction) -> None:
         """Remove *tx* from the registry."""
-        try:
-            del self.transactions[tx.branch]
-        except KeyError:
-            logger.warning("Transaction not found for removal: %r", tx)
+        self.transactions.pop(tx.branch, None)
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:  # type: ignore[override]
         """Handle transport readiness by starting carrier registration.
@@ -320,6 +325,9 @@ class SessionInitiationProtocol(asyncio.Protocol, asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:  # type: ignore[override]
         """Dispatch a complete UDP SIP datagram."""
+        if data == b"\x00\x00\x00\x00":
+            logger.info("PING", extra={"addr": addr})
+            return
         self.dispatch_frame(data)
 
     def error_received(self, exc: Exception) -> None:  # type: ignore[override]
@@ -534,12 +542,21 @@ class SessionInitiationProtocol(asyncio.Protocol, asyncio.DatagramProtocol):
             if self.aor.user
             else str(self.public_address)
         )
+        feature_tags = self.contact_feature_tags
         if self.aor.scheme == "sips":
-            return f"<sips:{address};ob>"
+            return f"<sips:{address};ob>{feature_tags}"
         if isinstance(self.transport, asyncio.DatagramTransport):
-            return f"<sip:{address};transport=udp>"
+            return f"<sip:{address};transport=udp>{feature_tags}"
         transport_param = "tls" if self.is_secure else "tcp"
-        return f"<sip:{address};transport={transport_param};ob>"
+        return f"<sip:{address};transport={transport_param};ob>{feature_tags}"
+
+    @property
+    def contact_feature_tags(self) -> str:
+        return "".join(
+            f";{name}" if value is None else f";{name}={value}"
+            for name, value in self.aor.parameters.items()
+            if name.startswith("+")
+        )
 
     def connection_lost(self, exc: Exception | None) -> None:
         """Respond to a lost or closed transport connection."""
